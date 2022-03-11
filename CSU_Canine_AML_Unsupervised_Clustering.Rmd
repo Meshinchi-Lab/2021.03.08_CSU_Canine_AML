@@ -1,0 +1,799 @@
+---
+title: "CSU Canine Leukemia"
+author: "Jenny Smith"
+date: "3/12/21"
+output: html_document
+---
+
+# Set-up 
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2021.03.08_CSU_Canine_AML"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+node=Sys.info()[["nodename"]]
+if(!grepl("local", node)){
+  print(node)
+  options(bitmapType = 'cairo')
+  grDevices::X11.options(type='cairo')
+}
+
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+
+library(ggplot2)
+library(gridExtra)
+library(patchwork)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+library(edgeR)
+library(DeGSEA)
+getwd()
+```
+
+# Define Functions
+
+```{r}
+joins <- function(file1, file2, pattern="*", cols=dplyr::everything()){
+  
+  if(is.vector(cols)){
+    cols <- dplyr::all_of(cols)
+  }
+  
+  if(is.character(file1)){
+    file1 <- read.delim(file1, sep="\t", comment.char = "#",skip=4, header = FALSE) %>%
+      dplyr::select(cols) %>%
+      dplyr::rename_all(~c("gene_id", gsub(pattern, "\\1", file1))) 
+  } 
+
+  file2 <- read.delim(file2, sep="\t", comment.char = "#",skip=4, header = FALSE) %>%
+    dplyr::select(cols) %>%
+    dplyr::rename_all(~c("gene_id", gsub(pattern, "\\1", file2)))
+
+  dplyr::full_join(file1, file2, by="gene_id")
+}
+```
+
+```{r}
+make_color_codes <- function(colname,palette,data){
+  
+  classes <- unique(data[[colname]])
+  
+  testit::assert("There are zero NAs", !any(is.na(classes)))
+  
+  n <- length(classes)
+  get_palette(palette, n)  %>%  set_names(classes)
+  
+}
+```
+
+# ClinData
+
+```{r}
+canine_info <- read.csv("CSU_Canine_Leukemia_sample_manifest_v2.csv") %>% 
+  set_rownames(.$rnaseq_identifier)
+
+head(canine_info)
+# dim(canine_info)
+```
+
+```{r eval=FALSE}
+# Read in the Sample Info
+# canine_manifest <- openxlsx::loadWorkbook(file.path(PROJHOME,"2021.03.08_CSU_Canine_AML/References/2021 CSU canine acute leukemia samples.xlsx"))
+# 
+# 
+# all_samples <- openxlsx::read.xlsx(canine_manifest, sheet="Masterlist") %>%
+#   janitor::clean_names()
+#  
+# clindata <- openxlsx::read.xlsx(canine_manifest, sheet="CBC data") %>% 
+#   janitor::clean_names()
+# 
+# 
+# # head(all_samples)
+# head(clindata)
+# dim(all_samples)
+# dim(clindata)
+
+
+# canine_info <- openxlsx::read.xlsx(canine_manifest,sheet="Patient Info") %>% 
+#   janitor::clean_names() %>% 
+#   full_join(., all_samples, by="csu_sample_number") %>% 
+#   full_join(., clindata, by="csu_sample_number") %>% 
+#   mutate(USI=rn_aseq_identifier)  %>% 
+#   select(rnaseq_identifier=rn_aseq_identifier,
+#          USI, 
+#          sex,
+#          matches("age|case|sample_type|dx|breed"),
+#          everything())  %>% 
+#   rename_at(vars( sample_type.x, sample_type.y), 
+#             ~c("tissue","disease")) %>% 
+#   mutate_at(vars(sex:tissue), ~case_when(
+#     rnaseq_identifier=="CL120096" ~ "cellline",
+#     TRUE ~ .))  %>% 
+#   mutate_at(vars(sex, breed), ~case_when(
+#     is.na(.) ~ tentative_dx,
+#     TRUE ~ .)) %>% 
+#   set_rownames(.$rnaseq_identifier)
+# 
+# head(canine_info)
+# dim(canine_info) #133   5
+# 
+# table(canine_info$tentative_dx,
+#       canine_info$case_control)
+
+
+# write.csv(canine_info, "CSU_Canine_Leukemia_sample_manifest.csv", row.names = FALSE)
+```
+
+
+
+# Gene References 
+
+```{r}
+orthologs <- read.csv("References/canFam_Human_homologs_orthologs.csv") %>% 
+  janitor::clean_names()
+
+
+head(orthologs)
+# dim(orthologs) #33564    14
+```
+
+```{r}
+AML_partners <- read.csv("References/TARGET_AML_refSeq_ensembl_transcript_IDmap.csv")
+
+# head(AML_partners)
+dim(AML_partners)
+```
+
+```{r}
+paml_fusions <- read.csv("Fusions/human/TARGET_AML_0531_1031_DiscoverySet_Diagnostic_Breakpoints_GenomicPos_withExons_Summary_02.01.21.csv")
+
+dim(paml_fusions)
+```
+
+```{r}
+beat_aml_fusions <- read.csv("Fusions/human/BEAT_AML_STAR_Fusion_reformatted_FilteredForNBM_PrimaryFusions_11.02.20.csv")
+
+
+dim(beat_aml_fusions)
+```
+
+```{r}
+tcga_aml_fusions <- read.csv("Fusions/human/TCGA_AML_updated_NEJM_SuppTable01_12.28.20.csv") %>% 
+  separate(Gene.Fusions.by.RNA.Seq, 
+           into=c("Fusion","Alternative.Fusion1", "Alternative.Fusion2"),
+           sep=",", extra="merge", fill="right")  %>% 
+  rowwise() %>% 
+  mutate_at(vars(matches("Fusion",ignore.case = FALSE)), ~paste(str_split_fixed(., pattern = "\\(|\\)", n=5)[,c(1,3)], collapse = "-")) %>% 
+  ungroup() %>% 
+  mutate_at(vars(matches("Fusion", ignore.case = FALSE)), ~gsub("^MLL-", "KMT2A-", .))
+
+
+dim(tcga_aml_fusions)
+# View(tcga_aml_fusions)
+```
+
+```{r}
+pall_fusions <- openxlsx::read.xlsx("Fusions/human/TARGET_ALL_ClinicalData_Phase_II_Discovery_20170525.xlsx")
+
+head(pall_fusions)
+```
+
+
+Is a way to compare the transcriptomes of these three subgroups with different human AML subsets?
+What human datasests would you use and what method would you use for comparison?
+Ultimately perhaps we can also find that the subgroups are characterized by unique fusions as well.
+
+# Available files 
+
+```{r}
+library(aws.s3)
+library(aws.signature)
+```
+
+```{r}
+#Set-up config
+creds <- aws.signature::use_credentials(profile = "default")
+Sys.setenv("AWS_ACCESS_KEY_ID" = creds$default$AWS_ACCESS_KEY_ID,
+           "AWS_SECRET_ACCESS_KEY" = creds$default$AWS_SECRET_ACCESS_KEY,
+           "AWS_DEFAULT_REGION"="us-west-2")
+
+
+blist <- bucketlist()
+BUCKET=blist[2,"Bucket"]
+PREFIX="CSU_Canine_AML/210105_ACUTE_RNASEQ_HarrisA/X202SC20092463-Z01-F001_up"
+
+files <- get_bucket_df(bucket = BUCKET, 
+                      prefix = PREFIX,
+                      max = Inf)
+
+head(files) 
+# dim(files) #22473     8
+
+# write.csv(files,"CSU_Novagene_available_files.csv", row.names = FALSE)
+```
+
+```{r}
+fusion_files <- files %>% 
+  filter(grepl("Fusion", Key, ignore.case = TRUE)) %>% 
+  filter(grepl("final-list_candidate-fusion-genes.txt", Key)) %>% 
+  rowwise() %>% 
+  mutate(filename=paste(str_split_fixed(Key, pattern = "/", n=7)[,6:7], collapse = "_")) %>% 
+  ungroup() %>% 
+  select(filename, Key, Bucket, everything())
+
+
+head(fusion_files)
+```
+
+```{r}
+#download the files 
+outpath=file.path(SCRATCH,"jlsmith3/CSU_Canine_AML/fusion")
+
+# purrr::map(1:nrow(fusion_files), function(i){
+#   save_object(object=fusion_files$Key[i], 
+#               bucket=fusion_files$Bucket[i], 
+#               file=file.path(outpath, fusion_files$filename[i]))
+# })
+```
+
+# Concatenate the RNA-seq Counts
+
+https://rnabio.org/module-09-appendix/0009/12/01/StrandSettings/
+
+https://physiology.med.cornell.edu/faculty/skrabanek/lab/angsd/lecture_notes/STARmanual.pdf
+column 1: gene ID
+column 2: counts for unstranded RNA-seq
+column 3: counts for the 1st read strand aligned with RNA (htseq-count option -s yes)
+column 4: counts for the 2nd read strand aligned with RNA (htseq-count option -s reverse)
+
+```{r eval=FALSE}
+cts_dir <- file.path(SCRATCH,"jlsmith3/CSU_Canine_AML/counts")
+files <- dir(cts_dir, full.names = TRUE,  pattern=".tab")
+
+
+head(files)
+length(files)
+
+pattern <- c("^.+K[0-9]+_([A-Z]{1,2}[0-9]+)_.+")
+
+ids <- gsub(pattern, "\\1", files)
+cols <- c(1,4)
+
+cated_counts <- purrr::reduce(.x=files, .f=joins, pattern=pattern, cols=cols)
+
+# str(cated_counts)
+# head(cated_counts[,1:5])
+# write.csv(cated_counts, "Expression_data/CSU_Canine_AML_RNAseq_STAR_ReadsPerGene_counts.csv", row.names = FALSE)
+```
+
+# Examine Canine Fusions
+
+```{r}
+pall_fusions_list <- unique(pall_fusions$ALL.Molecular.Subtype) %>% 
+  grep("-", ., value=TRUE) %>% 
+  gsub("MLL-.+", "KMT2A", .)
+
+length(pall_fusions_list) #5
+# noquote(pall_fusions_list)
+```
+
+```{r}
+paml_fusions_list <- unique(paml_fusions$Fusion)
+# head(paml_fusions_list)
+length(paml_fusions_list) #127
+```
+
+```{r}
+tcga_aml_fusions_list <- tcga_aml_fusions %>% 
+  select(Fusion, Alternative.Fusion1, Alternative.Fusion2) %>% 
+  unlist() %>% 
+  unname() %>% 
+  unique() %>% 
+  grep("^ ?-$",., invert=TRUE, value=TRUE)
+
+length(tcga_aml_fusions_list) #67
+```
+
+```{r}
+common_aml_fusions <- orthologs %>% 
+  select(1:2,gene_name,human_gene_name,
+         human_gene_order_conservation_score,
+         human_orthology_confidence_0_low_1_high,
+         human_whole_genome_alignment_coverage,
+         everything()) %>% 
+  filter(gene_name %in% AML_partners$external_gene_name)
+
+
+head(common_aml_fusions)
+# View(common_aml_fusions)
+#ENSCAFG00000009078 RUNX1T1
+```
+
+## Combine STAR and TransAbyss
+
+```{r}
+star <- read.csv("Fusions/CSU_Canine_AML_BCCA_STAR_Fusion_reformatted_FilteredForNormals_PrimaryFusions_10.27.2021.csv") %>% 
+  rename_at(vars(X.Fusion:fusion_in_controls), ~paste0(.,".STAR"))
+
+head(star)
+# dim(star)
+```
+
+```{r}
+transAbyss <- read.csv("Fusions/CSU_Canine_AML_BCCA_TransAbyss_Fusion_reformatted_FilteredForNormals_PrimaryFusions_10.28.2021.csv") %>% 
+  mutate_at(vars(Fusion.Category), ~gsub("NonePassedFilter-NonePassedFilter", "NonePassedFilter", .)) %>% 
+  rename_at(vars(Fusion:sum.break.reads), ~paste0(., ".TA"))
+
+
+# dim(transAbyss)
+head(transAbyss)
+```
+
+```{r}
+all_fusions <- star %>% 
+  full_join(., transAbyss, 
+            by=c("rnaseq_identifier", "Fusion.Category")) %>% 
+  select(-Library) %>%
+  left_join(canine_info, ., by="rnaseq_identifier") %>%
+  mutate(two_callers=ifelse(!is.na(X.Fusion.STAR) & !is.na(Fusion.TA), "2 Callers", "1 Caller")) %>% 
+  mutate(Fusion_in_pALL=case_when(
+      Fusion.Category %in% pall_fusions_list | X.Fusion.STAR %in% pall_fusions_list | Fusion.TA %in% pall_fusions_list ~ "Yes"), 
+    Fusion_in_pAML=case_when(
+      Fusion.Category %in% paml_fusions_list | X.Fusion.STAR %in% paml_fusions_list | Fusion.TA %in% paml_fusions_list ~ "Yes"), 
+    Fusion_in_tcgaAML=case_when(
+      Fusion.Category %in% tcga_aml_fusions_list | X.Fusion.STAR %in% tcga_aml_fusions_list | Fusion.TA %in% tcga_aml_fusions_list ~ "Yes")) %>% 
+  select(rnaseq_identifier, Library,
+         tentative_dx,
+         two_callers,
+         Fusion.Category,
+         matches("X.Fusion|Fusion.TA"),
+         matches("Fusion_in_", ignore.case = FALSE),
+         matches("^breakpoint.TA|Breakpoints.STAR|^Alternative"),
+         matches("read"),
+         everything())
+
+
+dim(all_fusions) #3054   16
+# all_fusions
+
+# write.csv(all_fusions, "Fusions/CSU_Canine_AML_BCCA_TransAbyss_STAR_Fusion_reformatted_FilteredForNormals_PrimaryFusions_10.28.2021.csv")
+```
+
+## Examine Kknown Fusions 
+
+```{r}
+all_fusions <- read.csv("Fusions/CSU_Canine_AML_BCCA_TransAbyss_STAR_Fusion_reformatted_FilteredForNormals_PrimaryFusions_10.28.2021.csv")
+
+head(all_fusions)
+```
+
+```{r}
+pall_fusions_list
+
+all_fusions %>% 
+  filter(grepl("ENSCAF", Fusion.Category))
+
+orthologs %>% 
+  filter(grepl("ENSCAFG00000010865", gene_stable_id))
+```
+
+```{r}
+fusion_dbs <- readRDS("Fusions/human/Fusion_ReferenceFiles_10.8.18.RDS")
+
+# noquote(names(fusion_dbs))
+```
+
+
+```{r}
+subset  <- all_fusions %>% 
+  filter(two_callers == "2 Callers" | !is.na(Fusion_in_pALL) | !is.na(Fusion_in_pAML) | !is.na(Fusion_in_tcgaAML))
+
+
+# write.csv(subset,"CSU_Canine_Leukemia_STAR_TransAbyss_Fusions_shortList.csv", row.names = FALSE)
+```
+
+
+# Unsupervised Clustering
+
+```{r}
+counts <- read.csv("Expression_data/CSU_Canine_AML_RNAseq_STAR_ReadsPerGene_counts.csv") %>% 
+  column_to_rownames("gene_id")
+
+head(counts[,1:5])
+# dim(counts) #30424   133
+```
+
+```{r}
+# all(rownames(counts) %in% orthologs$gene_stable_id)
+```
+
+```{r}
+keep <- rowSums(cpm(counts) >= 1) >= 0.025*ncol(counts)
+cts.filtered <- counts[keep, ]
+
+dge <- DGEList(counts=cts.filtered)
+dge <- calcNormFactors(dge,method = "TMMwsp")
+
+logCPM <- edgeR::cpm(dge,log=TRUE,normalized.lib.sizes=TRUE, prior.count=1)
+CPM <- edgeR::cpm(dge,log=FALSE,normalized.lib.sizes=TRUE, prior.count=1)
+
+dim(logCPM) #15948   133
+# head(logCPM[,1:5])
+```
+
+## Heatmaps
+
+```{r}
+table(canine_info$tentative_dx)
+```
+
+```{r}
+suppressPackageStartupMessages(library(DelayedArray))
+obj <- seqGlue::calc_dispersion(as.matrix(CPM), removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks D
+sel_genes <- seqGlue::get_selected_genes(seqGlue::select_genes(obj, top_n=NULL))
+
+length(sel_genes) #4131
+# write.csv(sel_genes, "csu_selected_genes_10.28.2021.csv", row.names = FALSE)
+```
+
+```{r}
+library(ggpubr)
+
+cc_qc <- list()
+cc_qc[["sex"]] <- make_color_codes("sex","simpsons", canine_info)
+cc_qc[["tissue"]] <- make_color_codes("tissue","rickandmorty", canine_info)
+cc_qc[["tentative_dx"]] <- make_color_codes("tentative_dx","npg", canine_info)
+cc_qc[["breed"]] <- make_color_codes("breed","Spectral", canine_info)
+
+par(mar=c(10,5,5,5))
+test <- cc_qc$tentative_dx
+barplot(rep(1,length(test)),col = test, names.arg = names(test), las=2)
+```
+
+```{r}
+p <- canine_info$tentative_dx %>%
+  set_names(canine_info$rnaseq_identifier)
+
+dends_res <- dge_dendrograms(expnData = logCPM,
+                  pheno = p,
+                  log=TRUE,
+                  method = "ward.D2",
+                  percent=0.025,
+                  add.count=1,
+                  createDGE = FALSE,
+                  filterTopGenes = FALSE,
+                  genelist = sel_genes)
+
+table(sel_genes %in% rownames(dends_res$TMMCPM))
+
+# saveRDS(dends_res,"Clustering/heirarchical_clustering_10.28.2021.RDS")
+```
+
+```{r}
+library(ComplexHeatmap)
+```
+
+
+```{r}
+anno <- DeGSEA::create_HA_Labs_Hmap(expn=dends_res$TMMCPM,
+                                      geneList = sel_genes,
+                                      cc = cc_qc, #Need a test for all names being > length(0)
+                                      CDE = canine_info,
+                                      cols = names(cc_qc))
+
+hmap_res <- ComplexHmap(mat = dends_res$TMMCPM,
+              name = "Z-Scores",
+              scale=TRUE,
+              dge_dendrograms.res = dends_res,
+              hmap_anno_obj = anno$annoColumn)
+```
+
+```{r}
+# pdf("Figures/CSU_Canine_AML_heatmap.pdf", height = 10, width=20)
+hmap_res
+# dev.off()
+```
+
+
+## UMAP
+
+```{r}
+# Im wondering if I want to do VST on only FLT3-ITD or the whole dataset to capture variablility of FLT3-ITD in the presence of other AML subtypes?
+# or do I want to really look at intra-FLT3-ITD variablility?
+dds <- DESeq2::DESeqDataSetFromMatrix(round(cts.filtered[,canine_info$rnaseq_identifier],
+                                            digits = 0),
+                                      colData = canine_info,
+                                      design = ~ 1)
+
+
+dds <- DESeq2::estimateSizeFactors(dds)
+dds_cts <- DESeq2::counts(dds, normalized=TRUE)
+
+# plotDispEsts(dds)
+vst <- DESeq2::vst(dds, blind = TRUE)
+dim(vst)
+```
+
+```{r message=FALSE}
+suppressPackageStartupMessages(library(DelayedArray))
+
+sel_cts <- dds_cts
+obj <- seqGlue::calc_dispersion(as.matrix(sel_cts), removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks distance
+sg_dds <- seqGlue::get_selected_genes(seqGlue::select_genes(obj, top_n=NULL))
+length(sg_dds) #4502
+
+
+in_vst <- SummarizedExperiment::assay(vst)[sg_dds,canine_info$rnaseq_identifier]
+
+dim(in_vst) #4502  133
+head(in_vst[,1:5]) #
+head(dds_cts[sg_dds,1:5])
+```
+
+```{r}
+library(ggpubr)
+
+cc_qc <- list()
+cc_qc[["tentative_dx"]] <- make_color_codes("tentative_dx","npg", canine_info)
+cc_qc[["sex"]] <- make_color_codes("sex","simpsons", canine_info)
+cc_qc[["tissue"]] <- make_color_codes("tissue","rickandmorty", canine_info)
+cc_qc[["breed"]] <- make_color_codes("breed","Spectral", canine_info)
+
+par(mar=c(10,5,5,5))
+test <- cc_qc$tentative_dx
+barplot(rep(1,length(test)),col = test, names.arg = names(test), las=2)
+```
+
+
+Need to cite: devtools::install_github('cole-trapnell-lab/leidenbase') 
+
+n_neighbors	
+The size of local neighborhood (in terms of number of neighboring sample points) used for manifold approximation. Larger values result in more global views of the manifold, while smaller values result in more local data being preserved.
+
+min_dist	
+The effective minimum distance between embedded points. Smaller values will result in a more clustered/clumped embedding where nearby points on the manifold are drawn closer together, while larger values will result on a more even dispersal of points. 
+
+
+k	
+Integer number of nearest neighbors to use when creating the k nearest neighbor graph for Louvain/Leiden clustering. k is related to the resolution of the clustering result, a bigger k will result in lower resolution and vice versa. Default is 20.
+
+resolution	
+Parameter that controls the resolution of clustering. If NULL (Default), the parameter is determined automatically.
+
+```{r}
+Cols <- names(cc_qc)
+
+umap_bulk <- UMAP_workflow(TFIDF_Matrix = in_vst, 
+                           scale_data=FALSE,
+                           input_features = sg_dds,
+                            samples_vector = canine_info$rnaseq_identifier,
+                            sample_info_df = canine_info,
+                            Columns_for_Plots = Cols,
+                            cc = cc_qc, 
+                            addl_color_vector=rainbow(n=40),
+                            min_dist = 0.001,
+                            n_neighbors=14,
+                            k2=10,
+                            res2=0.025)
+
+```
+
+```{r}
+# saveRDS(umap_bulk,"Clustering/CSU_Canine_AML_UMAP_minDist0.0001_nn10_10.28.2021.RDS")
+# saveRDS(umap_bulk,"Clustering/CSU_Canine_AML_UMAP_minDist0.001_nn14_10.28.2021.RDS")
+
+umap_bulk <- readRDS("Clustering/CSU_Canine_AML_UMAP_minDist0.001_nn14_10.28.2021.RDS")
+```
+
+```{r fig.height=10, fig.width=7}
+# pdf("CSU_Canine_AML_UMAP_nn14_tentative_dx_10.28.2021.pdf", height = 8, width = 7)
+umap_bulk$umap_2D_scatter[[1]]
+# dev.off()
+
+# pdf("CSU_Canine_AML_UMAP_nn14_qc_10.28.2021.pdf", height = 8, width = 18)
+# grid.arrange(grobs=c(umap_bulk$umap_2D_scatter[2:4]), ncol=3)
+# dev.off()
+```
+
+```{r fig.width=10, fig.height=10}
+# pdf("CSU_Canine_AML_UMAP_nn14_tentative_dx_with_LeidenCluster_10.28.2021.pdf", height = 10, width = 10)
+(umap_bulk$umap_2D_scatter$tentative_dx + umap_bulk$cluster_plots2$scatter) / umap_bulk$cluster_plots2$barplot # plot_layout(widths = c(0.75, 1.0))
+# dev.off()
+```
+
+```{r}
+forAnne <- umap_bulk$umap_res %>% 
+  rename_at(vars(x:z), ~paste0("UMAP_",., "_dimension")) %>% 
+  select(matches("UMAP"), Leiden_cluster_number=cluster_k5,
+         library=Library, everything(),
+         -USI,-Sample,-matches("date|cluster_k1"))
+
+# forAnne
+
+# write.csv(forAnne,"Clustering/CSU_Canine_AML_UMAP_Results_minDist0.001_nn14_with_LeidenCluster_10.28.2021.csv", row.names = FALSE)
+# write.csv(data.frame(input_genes_for_UMAP=umap_bulk$input_features),"Clustering/CSU_Canine_AML_UMAP_input_genes_minDist0.001_nn14_with_LeidenCluster_10.28.2021.csv", row.names = FALSE)
+```
+
+### 3D plot 
+
+```{r}
+library(ggpubr)
+cc_3d <- list()
+cc_3d[["tentative_dx"]] <- make_color_codes("tentative_dx","npg", canine_info)
+# cc_qc[["sex"]] <- make_color_codes("sex","simpsons", canine_info)
+# cc_qc[["tissue"]] <- make_color_codes("tissue","rickandmorty", canine_info)
+# cc_qc[["breed"]] <- make_color_codes("breed","Spectral", canine_info)
+```
+
+```{r}
+umap_bulk$umap_res <- umap_bulk$umap_res %>% 
+    mutate_at(vars(age_at_diagnosis_y), ~round(., digits = 2)) %>% 
+  set_rownames(.$rnaseq_identifier)
+
+head(umap_bulk$umap_res)
+```
+
+```{r}
+plotly_res <- scatter_plots_3d(umap_workflow_res = umap_bulk, 
+                               Group_Column = "tentative_dx", 
+                               cc = cc_3d$tentative_dx,
+                               Cols = c("Sample","tentative_dx", "sex", "tissue","breed", "age_at_diagnosis_y"),
+                               blackbg = TRUE)
+```
+
+```{r}
+plotly_res
+```
+
+```{r}
+# htmlwidgets::saveWidget(widget = plotly_res, file = "CSU_Canine_AML_UMAP_Results_minDist0.001_nn14_with_LeidenCluster_3Dscatter_10.28.2021.html", 
+#                         background = "black")
+```
+
+### Fusion Positive Samples in UMAP
+
+```{r}
+known_fusions <- subset %>% 
+  filter(!is.na(Fusion_in_pAML) | !is.na(Fusion_in_tcgaAML)) %>% 
+  arrange(tentative_dx)
+
+known_fusions
+```
+
+```{r}
+known_fusion_samples <- umap_bulk$umap_res %>% 
+  filter(rnaseq_identifier %in% known_fusions$rnaseq_identifier) %>% 
+  mutate_at(vars(age_at_diagnosis_y), ~round(., digits = 2)) %>% 
+  left_join(select(known_fusions, rnaseq_identifier, two_callers:Fusion.TA), .,
+            by="rnaseq_identifier") %>% 
+  select(rnaseq_identifier:Fusion.TA, cluster_k5, tentative_dx, age_at_diagnosis_y,
+         -Fusion.Category) 
+
+
+# write.csv(known_fusion_samples,"CSU_canine_leukemia_fusions_of_interest.csv", row.names=FALSE)
+```
+
+### Clinical Characterisitics per Cluster 
+
+```{r}
+umap_bulk$umap_res  %>% 
+  filter(case_control=="Case") %>% 
+  mutate_at(vars(age_at_diagnosis_y), ~round(., digits = 2)) %>% 
+  group_by(cluster_k5) %>% 
+  summarize(Number_of_Sample=n(), 
+            mean_age=mean(age_at_diagnosis_y, na.rm=TRUE),
+            median_age=median(age_at_diagnosis_y, na.rm=TRUE),
+            range_age=paste0("[", min(age_at_diagnosis_y, na.rm=TRUE), "-", 
+                             max(age_at_diagnosis_y, na.rm=TRUE), "]")) %>% 
+  ungroup()
+```
+
+```{r}
+umap_bulk$umap_res  %>% 
+  filter(case_control=="Control") %>% 
+  mutate_at(vars(age_at_diagnosis_y), ~round(., digits = 2)) %>% 
+  group_by(cluster_k5) %>% 
+  summarize(Number_of_Samples=n(), 
+            mean_age=mean(age_at_diagnosis_y, na.rm=TRUE),
+            median_age=median(age_at_diagnosis_y, na.rm=TRUE),
+            range_age=paste0("[", min(age_at_diagnosis_y, na.rm=TRUE), "-", 
+                             max(age_at_diagnosis_y, na.rm=TRUE), "]")) %>% 
+  ungroup()
+```
+
+
+# Characterisitic Genes of AML and ALL
+
+```{r}
+AML.vs.NBM <- read.csv("References/AMLvsNBM_allGenes_DEGs.csv")
+
+# AML.vs.NBM
+```
+
+```{r}
+AML.cluster <- umap_bulk$umap_res %>% 
+  filter(cluster_k5==4 | grepl("Normal", tentative_dx)) %>% 
+  mutate(DE_groups=case_when(
+    cluster_k5==4 ~ "cluster4",
+    TRUE ~ "Normals")) %>% 
+  mutate(USI=rnaseq_identifier) %>% 
+  set_rownames(.$USI)
+
+head(AML.cluster)
+table(AML.cluster$tentative_dx)
+table(AML.cluster$DE_groups)
+```
+
+```{r}
+DE.AML.Clust <- twoGroups_DEGs(expnData = counts, 
+                               clinData = AML.cluster,
+                               col = "DE_groups",
+                               ref = "Normals",
+                               percent.cutoff = 0.05,
+                               anno = FALSE,
+                               SkipPlots = TRUE)
+```
+
+```{r}
+DEGs.AML.Clust <- extract_DEGs(DE.AML.Clust)  %>% 
+  left_join(., orthologs, by=c("gene"="gene_stable_id")) %>% 
+  select(gene, gene_name, human_gene_name,human_orthology_confidence_0_low_1_high,human_homology_type,
+         everything())
+
+dim(DEGs.AML.Clust) # 5096   21
+head(DEGs.AML.Clust)
+```
+
+```{r}
+DEGs.AML.Clust %>% 
+  filter(grepl("HOX", gene_name))
+```
+
+```{r}
+common_AML <- DEGs.AML.Clust %>% 
+  filter(human_gene_name %in% AML.vs.NBM$gene_name)
+  # filter(!grepl("^IG[HGKLVF]", human_gene_name)) 
+
+
+dim(common_AML)
+```
+
+```{r}
+AML.markers <-   filter(DEGs.AML.Clust, grepl("CD34|CLEC|MSLN|CD33|FLT3|WT1|KIT|NCAM1|FOLR|GLIS|HOX|NPM1", human_gene_name))
+
+AML.markers
+# write.csv(AML.markers, "CSU_Canine_AML_human_marker_genes.csv", row.names = FALSE)
+```
+
+
+```{r}
+# head(common_AML) %>% 
+#   write.csv(., "common_AML_canine_human_up.csv", row.names = FALSE)
+
+
+# tail(common_AML, n=6) %>% 
+#   write.csv(., "common_AML_canine_human_down.csv")
+```
+
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+

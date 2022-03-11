@@ -1,0 +1,532 @@
+---
+title: "CSU Canine Leukemia"
+author: "Jenny Smith"
+date: "3/12/21"
+output: html_document
+---
+
+# Set-up 
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2021.03.08_CSU_Canine_AML"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+node=Sys.info()[["nodename"]]
+if(!grepl("local", node)){
+  print(node)
+  options(bitmapType = 'cairo')
+  grDevices::X11.options(type='cairo')
+}
+
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+
+library(ggplot2)
+library(gridExtra)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+
+library(DeGSEA)
+
+getwd()
+```
+
+
+# ClinData
+
+```{r}
+canine_info <- read.csv("CSU_Canine_Leukemia_sample_manifest_v2.csv")
+
+head(canine_info)
+dim(canine_info)
+```
+
+```{r}
+# cts_dir <- file.path(SCRATCH,"jlsmith3/CSU_Canine_AML/counts")
+# files <- dir(cts_dir, full.names = TRUE,  pattern=".tab")
+# IDmap <- str_split_fixed(files, pattern = "_", n=10)[,c(4,5)] %>%
+#   as.data.frame() %>%
+#   separate(V1, into=c("path","Library"), sep="-") %>%
+#   select(Library, rnaseq_identifier=V2) %>%
+#   left_join(., sample_info, by="rnaseq_identifier")
+
+ 
+# IDmap
+# write.csv(IDmap, "CSU_Canine_Leukemia_sample_manifest_v2.csv", row.names = FALSE)
+```
+
+# Gene Annotatations 
+
+```{r}
+AML_partners <- read.csv("References/TARGET_AML_refSeq_ensembl_transcript_IDmap.csv")
+
+# head(AML_partners)
+# dim(AML_partners)
+```
+
+```{r}
+orthologs <- read.csv("References/canFam_Human_homologs_orthologs.csv") %>% 
+  janitor::clean_names()
+
+
+# head(orthologs)
+# dim(orthologs)
+```
+
+```{r}
+common_aml_fusions <- orthologs %>% 
+  select(1:2,gene_name,human_gene_name,
+         human_gene_order_conservation_score,
+         human_orthology_confidence_0_low_1_high,
+         human_whole_genome_alignment_coverage,
+         everything()) %>% 
+  filter(gene_name %in% AML_partners$external_gene_name)
+
+# common_aml_fusions
+```
+
+
+# BCCA 
+
+
+```{r}
+outpath=file.path(SCRATCH,"jlsmith3/CSU_Canine_AML/BCCA_fusion")
+fusion_res <- dir(outpath, pattern="star-fusion.fusion_predictions.abridged.tsv",
+                  recursive=TRUE, full.names = TRUE) %>% 
+  grep("odd",., invert=TRUE, value=TRUE)
+
+# head(fusion_res)
+# length(fusion_res)
+```
+
+```{r}
+fusions <- purrr::map_dfr(.x=fusion_res, .f=function(x){
+  read.delim(x, sep="\t", header=TRUE) %>% 
+    mutate(Library=gsub("^.+fusion\\/([K][0-9]+)\\/.+","\\1", x))
+   
+}) %>% 
+  left_join(., select(sample_info, Library, rnaseq_identifier),
+            by="Library") %>% 
+   select(Library,rnaseq_identifier, everything())
+
+head(fusions)
+dim(fusions) #5996   19
+
+# length(unique(fusions$Library)) #133
+# write.csv(fusions, "Fusions/CSU_Canine_AML_BCCA_STAR_Fusion_original.csv", row.names = FALSE)
+```
+
+```{r}
+# fusions %>% 
+#   filter(grepl("KMT2A|NUP98|CBFB|RUNX1", X.FusionName))
+# regex <- paste(common_aml_fusions$gene_name, collapse = "|")
+
+# star %>% 
+#   filter(grepl(regex, X.FusionName)) %>% 
+#   arrange(X.FusionName)
+```
+
+The number of fusions appears to be very, very low. I will need to ask which paramters were used for STAR-fusion by BCCA.
+
+
+# Reformat STAR fusion to Include Custom Columns 
+
+```{r}
+star <- read.csv("Fusions/CSU_Canine_AML_BCCA_STAR_Fusion_original.csv")
+
+dim(star)
+head(star)
+```
+
+```{r}
+star.fmt <- star %>% 
+    select(Library, rnaseq_identifier,
+           X.Fusion=X.FusionName,
+           Left.Breakpoint=LeftBreakpoint,
+           Right.Breakpoint=RightBreakpoint,
+           JunctionRead=JunctionReadCount,
+           SpanningRead=SpanningFragCount,
+          everything()) %>%
+  
+    #replace dashes with a dot. for consistency withother datasets.
+    mutate_at(vars(X.Fusion,LeftGene,RightGene),
+              ~gsub("-", "\\.", .)) %>% 
+    mutate(Left.Gene=str_split_fixed(LeftGene,"\\^",n=2)[,1],
+           Right.Gene=str_split_fixed(RightGene,"\\^",n=2)[,1],
+           Left.Chr=str_split_fixed(Left.Breakpoint, ":", n=3)[,1],
+           Right.Chr=str_split_fixed(Right.Breakpoint,":", n=3)[,1],
+           
+           Left.Strand=str_split_fixed(Left.Breakpoint, ":", n=3)[,3],
+           Right.Strand=str_split_fixed(Right.Breakpoint,":", n=3)[,3],
+           
+           Breakpoints = paste(gsub("chr|:[\\+-]","",Left.Breakpoint),
+                               gsub("chr|:[\\+-]","",Right.Breakpoint),
+                               sep="|"),
+           Type = ifelse(Left.Chr == Right.Chr,
+                         "intrachromosomal","interchromosomal")
+           ) %>%
+    mutate(X.Fusion = gsub("\\.{2}","-",X.Fusion)) %>%
+    mutate(Fusion.Detected.STAR=ifelse(is.na(X.Fusion), "NoneDetected","Detected")) %>%
+    mutate_at(vars(X.Fusion:Type),
+              ~ifelse(Fusion.Detected.STAR=="NoneDetected", "NoneDetected",.))  %>% 
+  select(Library:X.Fusion, Breakpoints, everything())
+  
+
+dim(star.fmt)
+# length(unique(star.fmt$Library)) 
+```
+
+```{r}
+head(star.fmt)
+# write.csv(star.fmt, "Fusions/CSU_Canine_AML_BCCA_STAR_Fusion_reformatted_10.27.2021.csv", row.names = FALSE)
+```
+
+
+# Filter out Fusions found in NBMs 
+
+```{r}
+normals <- canine_info %>% 
+  filter(grepl("Normal", tentative_dx))
+
+fusions_normal <- star.fmt %>% 
+  filter(rnaseq_identifier %in% normals$rnaseq_identifier)
+
+dim(fusions_normal) #610
+```
+
+```{r}
+star.fmt.filter <- star.fmt %>% 
+  select(rnaseq_identifier,everything()) %>%
+  mutate(fusion_in_controls=Breakpoints %in% fusions_normal$Breakpoints) %>% 
+  
+  group_by(rnaseq_identifier) %>% 
+  mutate(all_fail=case_when(
+    sum(fusion_in_controls) == n() ~ TRUE,
+    TRUE ~ FALSE)) %>% 
+  ungroup() %>% 
+  
+  mutate(across(.cols=c(X.Fusion:Fusion.Detected.STAR), .fns = ~case_when(
+    is.character(.x) & all_fail ~ "NonePassedFilter", 
+    is.numeric(.x) & all_fail  ~ NA_character_,
+    TRUE ~ as.character(.)))) %>% 
+  distinct() %>% 
+  
+  filter(!fusion_in_controls | X.Fusion=="NonePassedFilter") %>%
+  
+  select(rnaseq_identifier:X.Fusion,
+         Left.Gene,Right.Gene,
+         everything(), -all_fail)
+
+
+dim(star.fmt.filter) # 1558   29
+
+# length(unique(star.fmt.filter$Library))
+# table(star.fmt.filter$fusion_in_controls)
+# table(star.fmt.filter$all_fail)
+# table(star.fmt.filter$Type)
+```
+
+
+```{r}
+head(star.fmt.filter)
+# write.csv(star.fmt.filter, "Fusions/CSU_Canine_AML_BCCA_STAR_Fusion_reformatted_FilteredForNormals_10.27.2021.csv", row.names = FALSE)
+```
+
+
+
+# Define the Primary Fusions/Breakpoints per patient 
+
+```{r}
+fusionCategory <- function(geneA,geneB){
+  fus <- c(geneA,geneB)
+  fus <- paste(fus[order(fus)], collapse = "-") #order alphabetically, so that the category includes  reciprocal fusions
+}
+```
+
+```{r}
+collapseFusions <- function(breakpoint){
+  paste(unique(breakpoint), collapse = "; ")
+}
+```
+
+```{r}
+fillNA <- function(x,USI){
+  
+  USI <- unique(USI)
+  x <- x %>% .[!is.na(.)] %>% unique()
+  
+  if(length(x) < 1){
+    x <- ""
+  }
+  
+  # print(x)
+  return(x)
+}
+```
+
+```{r}
+getPrimaryFusion <- function(USI, junction_reads,spanning_reads){
+
+
+  resolveTies <- function(df){
+        df <- df %>%
+            group_by(primary) %>%
+            #if still a tie in breakpoint pairs counts, choose the first.
+            mutate(rank=rank(junction_reads, ties.method = "first")) %>%  
+            #convert all alternate fusion calls to zero rank (eg not going to be used in tie-breaking)
+            mutate(rank=ifelse(primary=="alternate", 0, rank)) %>%
+            rowwise() %>%
+            mutate(reason=sum(reason,rank)) %>%
+            ungroup() %>% 
+            #the fusion with highest # of breakpoint reads will have largest interger rank. 
+            mutate(primary=ifelse(reason == max(reason),
+                                  "primary", "alternate"))
+        
+        return(df)
+    }
+  
+  #First check that the reads are not NA values (eg. NBM samples)
+  if (all(is.na(junction_reads))){
+    res <- NA
+    return(res)
+  }
+  
+  
+  #Create boolean vectors for each type of evidence supporting the "primary" fusion. 
+  USI <- unique(USI)
+  brk.reads <-  junction_reads == max(junction_reads)
+  spanning.reads <- spanning_reads == max(spanning_reads)
+
+  #Create a temporary data frame. 
+  temp <- data.frame("brk.reads.bool"=brk.reads,
+                     "spanning.reads.bool"=spanning.reads, 
+                     stringsAsFactors = FALSE) %>%
+    #add in the subsetted per patient read counts. For visual checking on ties, etc. 
+    bind_cols(.,list("junction_reads"=junction_reads,
+                     "spanning_reads"=spanning_reads))
+  
+  #will select the one with the highest reads
+    temp <- temp %>%
+        rowwise() %>%
+        mutate(reason=sum(brk.reads.bool,spanning.reads.bool)) %>%
+        ungroup() %>%
+        mutate(primary=ifelse(reason == max(reason), "primary", "alternate"))
+
+    # break ties if there are multiple fusions with same #s of supporting reads.
+    # for those with highest evidence ("reason"), choose the one with the higher breakpoint reads
+    if (sum(temp$primary == "primary") > 1){
+        temp <- resolveTies(temp)
+        
+        # last check for ties, will break dplyr by returning a dataframe, not a vector. 
+        if (sum(temp$primary == "primary") > 1 ){
+          return(temp)
+        }
+    }
+
+  res <- temp$primary
+  
+  return(res)
+}
+```
+
+
+
+```{r warning=FALSE}
+star.fmt.primary <- star.fmt.filter %>% 
+  
+  rowwise() %>%
+  #Fusion category is to encompass both reciprocal fusions under 1 name. 
+  mutate(Fusion.Category=fusionCategory(Left.Gene,Right.Gene)) %>% 
+  mutate(across(c(JunctionRead,SpanningRead), ~as.numeric(.))) %>% 
+  ungroup() %>%
+
+  #Define the primary fusion per patient per fusion. 
+  group_by(rnaseq_identifier,Fusion.Category) %>%
+  mutate(Primary.Fusion=getPrimaryFusion(USI=rnaseq_identifier, 
+                                         junction_reads = JunctionRead, 
+                                         spanning_reads = SpanningRead)) %>%
+  arrange(rnaseq_identifier,Fusion.Category) %>%
+  
+  #Create a column for alterntate fusion breakpoints per patient per fusion. 
+  group_by(rnaseq_identifier,Fusion.Category,Primary.Fusion) %>%
+  mutate(Alternate.Breakpoints=ifelse(Primary.Fusion=="alternate",
+                                      collapseFusions(breakpoint = Breakpoints), NA)) %>%
+  ungroup() %>%
+
+  group_by(rnaseq_identifier, Fusion.Category) %>%
+  mutate(Alternate.Breakpoints=fillNA(Alternate.Breakpoints, USI=rnaseq_identifier)) %>%
+  mutate(Alternate.Breakpoints=ifelse(Breakpoints==Alternate.Breakpoints, "",Alternate.Breakpoints)) %>%
+  ungroup() %>%
+  
+  #Filter out the alternate fusion rows, so alternates only provide breakpoint information. 
+  filter(grepl("primary", Primary.Fusion) |
+           grepl("NonePassedFilter|NoneDetected", X.Fusion)) %>%
+  mutate_at(vars(Fusion.Category),
+            ~ifelse(grepl("NonePassedFilter-NonePassedFilter", .),
+                                                "NonePassedFilter", .)) %>%
+  select(rnaseq_identifier,
+         Type,Fusion.Category,
+         X.Fusion,Breakpoints,Alternate.Breakpoints,
+         SpanningRead, JunctionRead, 
+         Left.Gene, Left.Chr, Left.Breakpoint,
+         Right.Gene,Right.Chr, Right.Breakpoint,
+         Fusion.Detected.STAR,
+         everything(),
+         -Primary.Fusion)
+
+  
+dim(star.fmt.primary) #1365   31
+length(unique(star.fmt.primary$rnaseq_identifier)) #133
+```
+
+```{r}
+head(star.fmt.primary)
+# write.csv(star.fmt.primary, "Fusions/CSU_Canine_AML_BCCA_STAR_Fusion_reformatted_FilteredForNormals_PrimaryFusions_10.27.2021.csv", row.names=FALSE)
+```
+
+ 
+
+# Novagene 
+
+```{r}
+outpath=file.path(SCRATCH,"jlsmith3/CSU_Canine_AML/fusion")
+fusion_res <- dir(outpath, full.names = TRUE)
+# head(fusion_res)
+```
+
+```{r}
+fusions <- purrr::map_dfr(.x=fusion_res, .f=function(x){
+  read.delim(x, sep="\t", comment.char = "#") %>% 
+    mutate(rnaseq_identifier=gsub("^.+fusion\\/([A-Z].+)_final.+","\\1", x))
+})
+
+head(fusions)
+# dim(fusions) # 139486     17
+# write.csv(fusions, "CSU_Canine_AML_Novagene_Fusions_original.csv", row.names = FALSE)
+```
+
+```{r}
+fusions <-  read.csv("CSU_Canine_AML_Novagene_Fusions_original.csv")
+
+dim(fusions)
+```
+
+```{r}
+fusions.clean <- fusions %>% 
+  janitor::clean_names() %>% 
+  mutate_at(vars(gene_1_symbol_5end_fusion_partner), ~case_when(
+    .=="" ~ gene_1_id_5end_fusion_partner,
+    TRUE ~ .)) %>% 
+  mutate_at(vars(gene_2_symbol_3end_fusion_partner), ~case_when(
+    .=="" ~ gene_2_id_3end_fusion_partner,
+    TRUE ~ .)) %>% 
+  mutate(fusion=paste(gene_1_symbol_5end_fusion_partner, gene_2_symbol_3end_fusion_partner, sep="-"),
+         breakpoint=paste(gsub(":[\\+\\-]", "", fusion_point_for_gene_1_5end_fusion_partner),
+                           gsub(":[\\+\\-]", "", fusion_point_for_gene_2_3end_fusion_partner),
+                           sep = "|")) %>%
+  mutate(type=case_when(
+    str_split_fixed(fusion_point_for_gene_1_5end_fusion_partner, pattern = ":", n=3)[,1] == str_split_fixed(fusion_point_for_gene_2_3end_fusion_partner, pattern = ":", n=3)[,1] ~ "intrachromosomal",
+    TRUE ~ "interchromosomal")) %>% 
+  select(rnaseq_identifier, fusion, breakpoint,type, everything())
+  
+  
+head(fusions.clean)
+```
+
+```{r}
+normals <- canine_info %>% 
+  filter(grepl("Normal", tentative_dx))
+
+fusions_normal <- fusions.clean %>% 
+  filter(rnaseq_identifier %in% normals$rnaseq_identifier)
+
+# dim(fusions_normal) #17930    20
+```
+
+```{r}
+fusions_leukemia <- fusions.clean %>% 
+  mutate(fusion_in_controls=breakpoint %in% fusions_normal$breakpoint) %>% 
+  
+  group_by(rnaseq_identifier) %>% 
+  mutate(all_fail=case_when(
+    sum(fusion_in_controls) == n() ~ TRUE,
+    TRUE ~ FALSE)) %>% 
+  ungroup() %>% 
+  
+  mutate(across(.cols=c(fusion:predicted_effect), .fns = ~case_when(
+    is.character(.x) & all_fail ~ "Fusions filtered by controls", 
+    is.numeric(.x) ~ NA_character_,
+    TRUE ~ as.character(.)))) %>% 
+  distinct() %>% 
+  
+  filter(!fusion_in_controls) %>% 
+  mutate(Fusion.Category=paste0(geneA, geneB))
+
+
+dim(fusions_leukemia) #69175    22
+# table(fusions_leukemia$fusion_in_controls)
+```
+
+## Specific Fusions
+
+```{r}
+make_fusion_category <- function(geneA, geneB){
+  genes <- c(geneA,geneB)
+  genes <- genes[order(genes)]
+  paste(genes, collapse = "-")
+}
+```
+
+```{r}
+fusions_leukemia_known <- fusions_leukemia %>% 
+  mutate(fusion_category=make_fusion_category(gene_1_symbol_5end_fusion_partner,gene_2_symbol_3end_fusion_partner )) %>% 
+  select(1, fusion_category, everything()) %>% 
+  filter(fusion_category %in% fusions$fusion.category)
+  
+
+
+fusions_leukemia_known
+```
+
+
+## Any AML Partner
+
+
+
+```{r}
+any_known_fusions <- fusions_leukemia %>% 
+  filter(gene_1_id_5end_fusion_partner %in% common_aml_fusions$gene_stable_id |
+           gene_2_id_3end_fusion_partner %in% common_aml_fusions$gene_stable_id) 
+
+
+any_known_fusions %>% 
+  group_by(fusion,type) %>% 
+  dplyr::count() %>% 
+  ungroup() %>% 
+  arrange(type, desc(n)) 
+```
+
+
+
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
