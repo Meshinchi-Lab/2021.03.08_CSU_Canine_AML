@@ -444,11 +444,10 @@ table(canine_info$tentative_dx)
 
 ```{r}
 suppressPackageStartupMessages(library(DelayedArray))
-obj <- seqGlue::calc_dispersion(as.matrix(CPM), removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks D
+obj <- seqGlue::calc_dispersion(edgeR::getCounts(dge), removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks D
 sel_genes <- seqGlue::get_selected_genes(seqGlue::select_genes(obj, top_n=NULL))
 
-length(sel_genes) #4131
-# write.csv(sel_genes, "csu_selected_genes_10.28.2021.csv", row.names = FALSE)
+length(sel_genes) 
 ```
 
 ```{r}
@@ -513,8 +512,6 @@ hmap_res
 ## UMAP
 
 ```{r}
-# Im wondering if I want to do VST on only FLT3-ITD or the whole dataset to capture variablility of FLT3-ITD in the presence of other AML subtypes?
-# or do I want to really look at intra-FLT3-ITD variablility?
 dds <- DESeq2::DESeqDataSetFromMatrix(round(cts.filtered[,canine_info$rnaseq_identifier],
                                             digits = 0),
                                       colData = canine_info,
@@ -522,7 +519,7 @@ dds <- DESeq2::DESeqDataSetFromMatrix(round(cts.filtered[,canine_info$rnaseq_ide
 
 
 dds <- DESeq2::estimateSizeFactors(dds)
-dds_cts <- DESeq2::counts(dds, normalized=TRUE)
+dds_cts <- DESeq2::counts(dds, normalized=FALSE)
 
 # plotDispEsts(dds)
 vst <- DESeq2::vst(dds, blind = TRUE)
@@ -535,7 +532,7 @@ suppressPackageStartupMessages(library(DelayedArray))
 sel_cts <- dds_cts
 obj <- seqGlue::calc_dispersion(as.matrix(sel_cts), removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks distance
 sg_dds <- seqGlue::get_selected_genes(seqGlue::select_genes(obj, top_n=NULL))
-length(sg_dds) #4502
+length(sg_dds) 
 
 
 in_vst <- SummarizedExperiment::assay(vst)[sg_dds,canine_info$rnaseq_identifier]
